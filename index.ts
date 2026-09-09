@@ -39,6 +39,26 @@ function loadBusinessInfo(): string {
 
 const businessInfo = loadBusinessInfo();
 
+const CONVERSATIONS_PATH = path.join(__dirname, 'conversations.json');
+
+// Persists chat history to disk so restarting the bot doesn't wipe context.
+function loadConversations(): Map<string, Anthropic.MessageParam[]> {
+  try {
+    const raw = fs.readFileSync(CONVERSATIONS_PATH, 'utf-8');
+    const parsed = JSON.parse(raw) as Record<string, Anthropic.MessageParam[]>;
+    return new Map(Object.entries(parsed));
+  } catch {
+    return new Map();
+  }
+}
+
+function saveConversations(): void {
+  const asObject = Object.fromEntries(conversations);
+  fs.writeFile(CONVERSATIONS_PATH, JSON.stringify(asObject, null, 2), (err) => {
+    if (err) console.error('Failed to save conversations:', err);
+  });
+}
+
 const BASE_SYSTEM_PROMPT =
   'You are a helpful, friendly assistant chatting over WhatsApp. Keep replies short and conversational (a few sentences) unless the user asks for more detail. ' +
   'Write in plain text only. Never use any formatting: no bold, no italics, no asterisks, no underscores, no Markdown headings, no backticks. For lists use plain "- " or "1. " lines with no other symbols.';
@@ -70,7 +90,7 @@ const FALLBACK_ERROR_REPLIES = [
   'Hit a snag trying to reply — can you say that again?',
 ];
 
-const conversations = new Map<string, Anthropic.MessageParam[]>();
+const conversations = loadConversations();
 const pendingMessages = new Map<string, string[]>();
 const replyTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -135,6 +155,7 @@ async function getReply(chatId: string, userText: string): Promise<string> {
     content: reply || pickRandom(FALLBACK_EMPTY_REPLIES),
   });
   conversations.set(chatId, history.slice(-MAX_HISTORY_MESSAGES));
+  saveConversations();
 
   return reply || pickRandom(FALLBACK_EMPTY_REPLIES);
 }
