@@ -10,6 +10,10 @@
     "module": "nodenext",
     "target": "esnext",
     "types": ["node"],
+    // Node runs the .ts files directly, so relative imports keep the .ts
+    // extension the runtime needs.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
 
     // Other Outputs
     "sourceMap": true,

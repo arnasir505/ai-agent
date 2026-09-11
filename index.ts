@@ -9,6 +9,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { PREMIUM_TOOLS, executePremiumTool } from './tariffs.ts';
 import 'dotenv/config';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -69,14 +70,23 @@ const SYSTEM_PROMPT = businessInfo
 
 const MAX_HISTORY_MESSAGES = 20;
 
+// How many times a single reply may go back to the model after running a
+// premium calculator — one round covers the normal case, the rest leave room
+// for a retry if the model passed invalid parameters.
+const MAX_TOOL_ROUNDS = 4;
+
 // Wait this long after the user goes quiet before replying, so bursts of
 // messages get answered once instead of once per message.
-const MIN_REPLY_DELAY_MS = 5_000;
-const MAX_REPLY_DELAY_MS = 10_000;
+const MIN_REPLY_DELAY_MS = 3_000;
+const MAX_REPLY_DELAY_MS = 5_000;
 
 // Extra "typing" pause before actually sending, so replies don't appear instantly.
 const MIN_TYPING_DELAY_MS = 1_500;
-const MAX_TYPING_DELAY_MS = 4_000;
+const MAX_TYPING_DELAY_MS = 2_000;
+
+// Wait this long before retrying a dropped connection (e.g. no internet),
+// so a prolonged outage doesn't spin in a tight reconnect loop.
+const RECONNECT_DELAY_MS = 5_000;
 
 const FALLBACK_EMPTY_REPLIES = [
   'Hmm, not sure what to say to that.',
@@ -131,30 +141,64 @@ function stripFormatting(text: string): string {
     .replace(/`([^`\n]+)`/g, '$1'); // inline code
 }
 
+// Trimming must not leave a tool_result as the first message — the API
+// rejects a history whose opening message answers a tool call that is no
+// longer there.
+function trimHistory(
+  history: Anthropic.MessageParam[]
+): Anthropic.MessageParam[] {
+  const trimmed = history.slice(-MAX_HISTORY_MESSAGES);
+  const start = trimmed.findIndex(
+    (message) =>
+      message.role === 'user' &&
+      (typeof message.content === 'string' ||
+        !message.content.some((block) => block.type === 'tool_result'))
+  );
+  return start === -1 ? [] : trimmed.slice(start);
+}
+
 async function getReply(chatId: string, userText: string): Promise<string> {
   const history = conversations.get(chatId) ?? [];
   history.push({ role: 'user', content: userText });
 
-  const response = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 1024,
-    system: SYSTEM_PROMPT,
-    // Slightly higher temperature so replies (and especially near-duplicate
-    // messages) don't come back worded identically every time.
-    temperature: 1,
-    messages: history,
-  });
+  let reply = '';
 
-  const textBlock = response.content.find(
-    (block): block is Anthropic.TextBlock => block.type === 'text'
-  );
-  const reply = stripFormatting((textBlock?.text ?? '').trim()).trim();
+  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    const response = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 1024,
+      system: SYSTEM_PROMPT,
+      // Slightly higher temperature so replies (and especially near-duplicate
+      // messages) don't come back worded identically every time.
+      temperature: 1,
+      tools: PREMIUM_TOOLS,
+      messages: history,
+    });
 
-  history.push({
-    role: 'assistant',
-    content: reply || pickRandom(FALLBACK_EMPTY_REPLIES),
-  });
-  conversations.set(chatId, history.slice(-MAX_HISTORY_MESSAGES));
+    const toolUses = response.content.filter(
+      (block): block is Anthropic.ToolUseBlock => block.type === 'tool_use'
+    );
+
+    if (toolUses.length === 0) {
+      const textBlock = response.content.find(
+        (block): block is Anthropic.TextBlock => block.type === 'text'
+      );
+      reply =
+        stripFormatting((textBlock?.text ?? '').trim()).trim() ||
+        pickRandom(FALLBACK_EMPTY_REPLIES);
+      history.push({ role: 'assistant', content: reply });
+      break;
+    }
+
+    for (const toolUse of toolUses) {
+      console.log(`[tool] ${toolUse.name} ${JSON.stringify(toolUse.input)}`);
+    }
+
+    history.push({ role: 'assistant', content: response.content });
+    history.push({ role: 'user', content: toolUses.map(executePremiumTool) });
+  }
+
+  conversations.set(chatId, trimHistory(history));
   saveConversations();
 
   return reply || pickRandom(FALLBACK_EMPTY_REPLIES);
@@ -184,11 +228,14 @@ function clearAllPendingReplies(): void {
 // Lets you mute the bot from your own WhatsApp account instead of restarting
 // the process: send "!bot off" / "!bot on" in a chat to mute just that chat,
 // or "!bot off all" / "!bot on all" to mute everywhere.
+// Returns true if the text was a recognized "!bot ..." command (and handled
+// it), false otherwise — so the caller can tell a control command apart from
+// an ordinary message a specialist typed to the client.
 async function handleControlCommand(
   sock: WASocket,
   chatId: string,
   text: string
-): Promise<void> {
+): Promise<boolean> {
   const command = text.trim().toLowerCase();
 
   let reply: string;
@@ -213,11 +260,12 @@ async function handleControlCommand(
         ? '🤖 Paused for this chat.'
         : '🤖 Active.';
   } else {
-    return;
+    return false;
   }
 
   console.log(`[control] ${chatId}: ${command}`);
   await sock.sendMessage(chatId, { text: reply });
+  return true;
 }
 
 // Buffers messages per chat and, once the user has been quiet for a few
@@ -282,7 +330,7 @@ async function connectToWhatsApp() {
         shouldReconnect
       );
       if (shouldReconnect) {
-        connectToWhatsApp();
+        setTimeout(connectToWhatsApp, RECONNECT_DELAY_MS);
       }
     } else if (connection === 'open') {
       console.log('opened connection');
@@ -299,8 +347,19 @@ async function connectToWhatsApp() {
 
       if (m.key.fromMe) {
         // Messages you send yourself can be "!bot off" / "!bot on" (etc.) to
-        // mute/unmute without restarting the process.
-        if (text) void handleControlCommand(sock, chatId, text);
+        // mute/unmute without restarting the process. Any other message sent
+        // from this number means a specialist is replying to the client
+        // directly, so auto-pause the bot for that chat until "!bot on".
+        if (text) {
+          void (async () => {
+            const wasCommand = await handleControlCommand(sock, chatId, text);
+            if (!wasCommand && !isPaused(chatId)) {
+              pausedChats.add(chatId);
+              clearPendingReply(chatId);
+              console.log(`[${chatId}] specialist took over — auto-paused`);
+            }
+          })();
+        }
         continue;
       }
 
