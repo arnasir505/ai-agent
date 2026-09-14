@@ -68,6 +68,15 @@ const SYSTEM_PROMPT = businessInfo
   ? `${BASE_SYSTEM_PROMPT}\n\nUse the following business information to answer customer questions. If the answer isn't in this info, say you'll check and get back to them — don't make it up.\n\n${businessInfo}`
   : BASE_SYSTEM_PROMPT;
 
+// The business info is ~25k tokens and goes out with every single message, so
+// it dominates the bill. Tools render before the system prompt, so one
+// breakpoint here caches the tool definitions and the business info together.
+// Both are built once at startup, which keeps the cached prefix byte-identical
+// across requests — editing business-info.md and restarting writes a new entry.
+const SYSTEM_BLOCKS: Anthropic.TextBlockParam[] = [
+  { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral', ttl: '1h' } },
+];
+
 const MAX_HISTORY_MESSAGES = 20;
 
 // How many times a single reply may go back to the model after running a
@@ -89,15 +98,15 @@ const MAX_TYPING_DELAY_MS = 2_000;
 const RECONNECT_DELAY_MS = 5_000;
 
 const FALLBACK_EMPTY_REPLIES = [
-  'Hmm, not sure what to say to that.',
-  "Sorry, I couldn't come up with a reply to that.",
-  "I'm drawing a blank on that one.",
+  'Хм, даже не знаю, что на это ответить.',
+  'Извините, не получилось сформулировать ответ на это.',
+  'Затрудняюсь ответить на этот вопрос.',
 ];
 
 const FALLBACK_ERROR_REPLIES = [
-  'Sorry, I ran into an error processing that.',
-  'Ugh, something went wrong on my end there.',
-  'Hit a snag trying to reply — can you say that again?',
+  'Извините, при обработке произошла ошибка.',
+  'Ой, что-то пошло не так с моей стороны.',
+  'Возникла техническая заминка — не могли бы вы повторить сообщение?',
 ];
 
 const conversations = loadConversations();
@@ -167,13 +176,22 @@ async function getReply(chatId: string, userText: string): Promise<string> {
     const response = await anthropic.messages.create({
       model: MODEL,
       max_tokens: 1024,
-      system: SYSTEM_PROMPT,
+      system: SYSTEM_BLOCKS,
       // Slightly higher temperature so replies (and especially near-duplicate
       // messages) don't come back worded identically every time.
       temperature: 1,
       tools: PREMIUM_TOOLS,
       messages: history,
     });
+
+    // Cache hits are what make the large system prompt affordable. If `read`
+    // is regularly 0 while `write` is not, requests are arriving more than
+    // 5 minutes apart and the cache expires between them — switching the
+    // breakpoint above to `{ type: 'ephemeral', ttl: '1h' }` would pay off.
+    const usage = response.usage;
+    console.log(
+      `[usage] кэш: чтение ${usage.cache_read_input_tokens ?? 0}, запись ${usage.cache_creation_input_tokens ?? 0}, без кэша ${usage.input_tokens}`
+    );
 
     const toolUses = response.content.filter(
       (block): block is Anthropic.ToolUseBlock => block.type === 'tool_use'
@@ -242,23 +260,23 @@ async function handleControlCommand(
   if (command === '!bot off all' || command === '!bot pause all') {
     globallyPaused = true;
     clearAllPendingReplies();
-    reply = '🤖 Paused for all chats.';
+    reply = 'Бот на паузе для всех чатов.';
   } else if (command === '!bot on all' || command === '!bot resume all') {
     globallyPaused = false;
-    reply = '🤖 Resumed for all chats.';
+    reply = '🤖 Возобновлен для всех чатов.';
   } else if (command === '!bot off' || command === '!bot pause') {
     pausedChats.add(chatId);
     clearPendingReply(chatId);
-    reply = '🤖 Paused for this chat.';
+    reply = '🤖 Пауза для этого чата.';
   } else if (command === '!bot on' || command === '!bot resume') {
     pausedChats.delete(chatId);
-    reply = '🤖 Resumed for this chat.';
+    reply = '🤖 Возобновлен для этого чата.';
   } else if (command === '!bot status') {
     reply = globallyPaused
-      ? '🤖 Paused for all chats.'
+      ? '🤖 Пауза для всех чатов.'
       : pausedChats.has(chatId)
-        ? '🤖 Paused for this chat.'
-        : '🤖 Active.';
+        ? '🤖 Пауза для этого чата.'
+        : '🤖 Активен.';
   } else {
     return false;
   }
