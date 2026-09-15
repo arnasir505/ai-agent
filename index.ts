@@ -73,8 +73,14 @@ const SYSTEM_PROMPT = businessInfo
 // breakpoint here caches the tool definitions and the business info together.
 // Both are built once at startup, which keeps the cached prefix byte-identical
 // across requests — editing business-info.md and restarting writes a new entry.
+//
+// Default 5-minute TTL, not the 1-hour variant: messages arrive roughly every
+// 3 minutes, so each request refreshes the entry before it expires and the
+// cache stays warm for free. The 1-hour TTL only pays off for 5-60 minute
+// gaps between requests — at this message rate it would just double the
+// write cost for no benefit.
 const SYSTEM_BLOCKS: Anthropic.TextBlockParam[] = [
-  { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral', ttl: '1h' } },
+  { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } },
 ];
 
 const MAX_HISTORY_MESSAGES = 20;
