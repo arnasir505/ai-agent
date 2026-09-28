@@ -79,9 +79,21 @@ const SYSTEM_PROMPT = businessInfo
 // cache stays warm for free. The 1-hour TTL only pays off for 5-60 minute
 // gaps between requests — at this message rate it would just double the
 // write cost for no benefit.
-const SYSTEM_BLOCKS: Anthropic.TextBlockParam[] = [
-  { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } },
-];
+//
+// The date is appended because the model's own sense of "today" is stuck at
+// its training cutoff, which made it misread clients' birth years. It changes
+// once a day, so the cached prefix survives until midnight and costs one
+// extra cache write per day.
+function systemBlocks(): Anthropic.TextBlockParam[] {
+  const today = new Date().toLocaleDateString('ru-RU', { dateStyle: 'long' });
+  return [
+    {
+      type: 'text',
+      text: `${SYSTEM_PROMPT}\n\nСегодняшняя дата: ${today}.`,
+      cache_control: { type: 'ephemeral' },
+    },
+  ];
+}
 
 const MAX_HISTORY_MESSAGES = 20;
 
@@ -182,7 +194,7 @@ async function getReply(chatId: string, userText: string): Promise<string> {
     const response = await anthropic.messages.create({
       model: MODEL,
       max_tokens: 1024,
-      system: SYSTEM_BLOCKS,
+      system: systemBlocks(),
       // Slightly higher temperature so replies (and especially near-duplicate
       // messages) don't come back worded identically every time.
       temperature: 1,

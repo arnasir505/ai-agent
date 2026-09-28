@@ -123,12 +123,77 @@ function nonNegativeNumber(value: unknown, field: string): number {
   throw new Error(`Поле ${field} обязательно и не может быть отрицательным.`);
 }
 
+// Число полных лет, прошедших с даты. Принимает «ГГГГ-ММ-ДД», «ДД.ММ.ГГГГ» и
+// «ГГГГ». Модель не знает сегодняшнюю дату и ошибается в таком счёте, поэтому
+// возраст и стаж считаются здесь.
+function completedYears(
+  value: string,
+  field: string
+): { years: number; approximate: boolean } {
+  const today = new Date();
+  const iso = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(value);
+  const dotted = /^(\d{1,2})[.\/](\d{1,2})[.\/](\d{4})$/.exec(value);
+
+  if (iso || dotted) {
+    const year = Number(iso ? iso[1] : dotted?.[3]);
+    const month = Number(iso ? iso[2] : dotted?.[2]);
+    const day = Number(iso ? iso[3] : dotted?.[1]);
+    const birthdayPassed =
+      today.getMonth() + 1 > month ||
+      (today.getMonth() + 1 === month && today.getDate() >= day);
+    const years = today.getFullYear() - year - (birthdayPassed ? 0 : 1);
+    if (years < 0) {
+      throw new Error(`Поле ${field} не может быть датой в будущем.`);
+    }
+    return { years, approximate: false };
+  }
+
+  // Только год: день рождения мог ещё не наступить, поэтому результат может
+  // быть завышен на единицу.
+  const yearOnly = /^(\d{4})$/.exec(value);
+  if (yearOnly) {
+    const years = today.getFullYear() - Number(yearOnly[1]);
+    if (years < 0) {
+      throw new Error(`Поле ${field} не может быть годом в будущем.`);
+    }
+    return { years, approximate: true };
+  }
+
+  throw new Error(
+    `Поле ${field} должно быть в формате ГГГГ-ММ-ДД или ГГГГ, получено: ${JSON.stringify(value)}.`
+  );
+}
+
+function yearsFromDateOrNumber(
+  dateValue: unknown,
+  numberValue: unknown,
+  dateField: string,
+  numberField: string
+): { years: number; approximate: boolean } {
+  if (typeof dateValue === 'string' && dateValue.trim() !== '') {
+    return completedYears(dateValue.trim(), dateField);
+  }
+  if (
+    typeof numberValue === 'number' &&
+    Number.isFinite(numberValue) &&
+    numberValue >= 0
+  ) {
+    return { years: numberValue, approximate: false };
+  }
+  throw new Error(
+    `Нужно передать либо ${dateField} (ГГГГ-ММ-ДД или ГГГГ), либо ${numberField} числом.`
+  );
+}
+
 // Возраст 25 лет относится к категории «до 25 лет включительно», стаж ровно
 // 3 года — к категории «до 3 лет включительно». Границы определяются здесь,
 // чтобы модель не решала, в какую категорию попадает водитель.
-function osagoDriverFactor(input: Record<string, unknown>): Factor {
+function osagoDriverFactor(input: Record<string, unknown>): {
+  factor: Factor;
+  notes: string[];
+} {
   if (input.driver_limit === 'unlimited_or_legal_entity') {
-    return OSAGO_UNLIMITED_DRIVERS;
+    return { factor: OSAGO_UNLIMITED_DRIVERS, notes: [] };
   }
   if (input.driver_limit !== 'limited') {
     throw new Error(
@@ -139,28 +204,57 @@ function osagoDriverFactor(input: Record<string, unknown>): Factor {
   const drivers = input.drivers;
   if (!Array.isArray(drivers) || drivers.length === 0) {
     throw new Error(
-      'Поле drivers обязательно, когда driver_limit = limited: передай список водителей с их возрастом и стажем.'
+      'Поле drivers обязательно, когда driver_limit = limited: передай список водителей с их возрастом и стажем или датой рождения и датой выдачи прав.'
     );
   }
+
+  const notes: string[] = [];
 
   // При нескольких водителях применяется максимальный коэффициент.
   const factors = drivers.map((driver, index) => {
     const raw = (driver ?? {}) as Record<string, unknown>;
-    const age = positiveNumber(raw.age, `drivers[${index}].age`);
-    const experience = nonNegativeNumber(
-      raw.experience_years,
-      `drivers[${index}].experience_years`
+    const label = `drivers[${index}]`;
+    const age = yearsFromDateOrNumber(
+      raw.birth_date,
+      raw.age,
+      `${label}.birth_date`,
+      `${label}.age`
     );
-    const young = age <= 25;
-    const inexperienced = experience <= 3;
+    const experience = yearsFromDateOrNumber(
+      raw.license_date,
+      raw.experience_years,
+      `${label}.license_date`,
+      `${label}.experience_years`
+    );
+
+    // Год без дня и месяца даёт разброс в один год. На тариф это влияет,
+    // только когда результат попал на первую ступень за границей категории.
+    if (age.approximate && age.years === 26) {
+      notes.push(
+        'Возраст указан только годом рождения — водителю может быть 25 или 26 лет, а это разные коэффициенты. Уточни у клиента полную дату рождения и пересчитай.'
+      );
+    }
+    if (experience.approximate && experience.years === 4) {
+      notes.push(
+        'Стаж указан только годом выдачи прав — он может быть 3 или 4 года, а это разные коэффициенты. Уточни у клиента полную дату выдачи прав и пересчитай.'
+      );
+    }
+
+    const young = age.years <= 25;
+    const inexperienced = experience.years <= 3;
     const k = young ? (inexperienced ? 1.4 : 1.3) : inexperienced ? 1.2 : 1.0;
     return {
       k,
-      label: `водитель ${age} лет, стаж ${experience} лет`,
+      label: `водитель ${age.years} лет, стаж ${experience.years} лет`,
     };
   });
 
-  return factors.reduce((worst, factor) => (factor.k > worst.k ? factor : worst));
+  return {
+    factor: factors.reduce((worst, factor) =>
+      factor.k > worst.k ? factor : worst
+    ),
+    notes,
+  };
 }
 
 function requiredBoolean(value: unknown, field: string): boolean {
@@ -183,7 +277,12 @@ function formatFormula(
   return `${head} × ${chain} = ${somFormat.format(premium)} сом`;
 }
 
-type Calculation = { premium_som: number; period: string; formula: string };
+type Calculation = {
+  premium_som: number;
+  period: string;
+  formula: string;
+  notes: string[];
+};
 
 function calculateOsago(input: Record<string, unknown>): Calculation {
   const hasCard = requiredBoolean(
@@ -199,9 +298,11 @@ function calculateOsago(input: Record<string, unknown>): Calculation {
       ? 1
       : positiveNumber(input.bonus_malus, 'bonus_malus');
 
+  const drivers = osagoDriverFactor(input);
+
   const factors: Factor[] = [
     lookup(OSAGO_VEHICLE, input.vehicle_type, 'vehicle_type'),
-    osagoDriverFactor(input),
+    drivers.factor,
     { k: bonusMalus, label: 'бонус-малус' },
     OSAGO_DIAGNOSTIC_CARD[hasCard ? 'yes' : 'no'],
     lookup(OSAGO_TERM, input.term, 'term'),
@@ -213,6 +314,7 @@ function calculateOsago(input: Record<string, unknown>): Calculation {
   return {
     premium_som: premium,
     period: 'за весь срок страхования',
+    notes: drivers.notes,
     formula: formatFormula(
       `${numFormat.format(OSAGO_BASE_PREMIUM)} (базовая премия)`,
       factors,
@@ -234,6 +336,7 @@ function calculateOsppRoad(input: Record<string, unknown>): Calculation {
   return {
     premium_som: premium,
     period: 'в год',
+    notes: [],
     formula: formatFormula('0,045% (базовый тариф)', factors, premium),
   };
 }
@@ -248,6 +351,7 @@ function calculateOsppAir(input: Record<string, unknown>): Calculation {
   return {
     premium_som: premium,
     period: 'за один рейс',
+    notes: [],
     formula: formatFormula('0,007% (базовый тариф)', factors, premium),
   };
 }
@@ -265,6 +369,7 @@ function calculateOsppRail(input: Record<string, unknown>): Calculation {
   return {
     premium_som: premium,
     period: 'в год',
+    notes: [],
     formula: formatFormula('5% (базовый тариф)', factors, premium),
   };
 }
@@ -283,6 +388,7 @@ function calculateOsppWater(input: Record<string, unknown>): Calculation {
   return {
     premium_som: premium,
     period: 'за год страхования',
+    notes: [],
     formula: formatFormula('1% (базовый тариф)', factors, premium),
   };
 }
@@ -309,17 +415,31 @@ export const PREMIUM_TOOLS: Anthropic.Tool[] = [
         drivers: {
           type: 'array',
           description:
-            'Обязательно, когда driver_limit = limited: все водители, допущенные к управлению. Передавай возраст и стаж так, как их назвал клиент, не определяй категорию сам.',
+            'Обязательно, когда driver_limit = limited: все водители, допущенные к управлению. Передавай то, что назвал клиент, как есть — не определяй категорию и не вычисляй возраст или стаж сам.',
           items: {
             type: 'object',
             properties: {
-              age: { type: 'number', description: 'Возраст водителя в годах.' },
+              birth_date: {
+                type: 'string',
+                description:
+                  'Дата рождения, если клиент назвал дату или год рождения: ГГГГ-ММ-ДД, либо только ГГГГ, если известен один год. Возраст будет посчитан автоматически — не считай его сам.',
+              },
+              age: {
+                type: 'number',
+                description:
+                  'Возраст в полных годах — только если клиент назвал именно возраст, а не дату рождения.',
+              },
+              license_date: {
+                type: 'string',
+                description:
+                  'Дата получения водительских прав, если клиент назвал её вместо стажа: ГГГГ-ММ-ДД или ГГГГ. Стаж будет посчитан автоматически.',
+              },
               experience_years: {
                 type: 'number',
-                description: 'Водительский стаж в годах.',
+                description:
+                  'Водительский стаж в годах — только если клиент назвал именно стаж. Допустимы дробные значения: «пару месяцев» — 0.2.',
               },
             },
-            required: ['age', 'experience_years'],
           },
         },
         has_diagnostic_card: {
@@ -410,29 +530,36 @@ export function executePremiumTool(
   try {
     const input = (toolUse.input ?? {}) as Record<string, unknown>;
     const payload: Record<string, unknown> = {};
+    const notes: string[] = [];
+
+    const apply = ({ notes: calcNotes, ...rest }: Calculation): void => {
+      Object.assign(payload, rest);
+      notes.push(...calcNotes);
+    };
 
     if (toolUse.name === 'calculate_osago_premium') {
-      Object.assign(payload, calculateOsago(input));
+      apply(calculateOsago(input));
       if (input.bonus_malus === undefined) {
-        payload.note =
-          'Бонус-малус принят равным 1 (класс 3). Если у клиента были выплаты по предыдущим полисам ОСАГО, итоговая стоимость может отличаться.';
+        notes.push(
+          'Бонус-малус принят равным 1 (класс 3). Если у клиента были выплаты по предыдущим полисам ОСАГО, итоговая стоимость может отличаться.'
+        );
       }
     } else if (toolUse.name === 'calculate_ospp_premium') {
       switch (input.transport_mode) {
         case 'road':
-          Object.assign(payload, calculateOsppRoad(input));
+          apply(calculateOsppRoad(input));
           break;
         case 'air':
-          Object.assign(payload, calculateOsppAir(input));
-          payload.note = NO_TAX_NOTE;
+          apply(calculateOsppAir(input));
+          notes.push(NO_TAX_NOTE);
           break;
         case 'rail':
-          Object.assign(payload, calculateOsppRail(input));
-          payload.note = NO_TAX_NOTE;
+          apply(calculateOsppRail(input));
+          notes.push(NO_TAX_NOTE);
           break;
         case 'water':
-          Object.assign(payload, calculateOsppWater(input));
-          payload.note = NO_TAX_NOTE;
+          apply(calculateOsppWater(input));
+          notes.push(NO_TAX_NOTE);
           break;
         default:
           throw new Error(
@@ -442,6 +569,8 @@ export function executePremiumTool(
     } else {
       throw new Error(`Неизвестный инструмент: ${toolUse.name}.`);
     }
+
+    if (notes.length > 0) payload.notes = notes;
 
     return {
       type: 'tool_result',
