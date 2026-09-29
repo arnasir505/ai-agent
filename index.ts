@@ -42,11 +42,36 @@ const businessInfo = loadBusinessInfo();
 
 const CONVERSATIONS_PATH = path.join(__dirname, 'conversations.json');
 
+// The timestamp is for people reading conversations.json. The API rejects
+// unknown fields on messages, so it is stripped before every request.
+// Messages saved before timestamps existed simply don't have one.
+type StoredMessage = Anthropic.MessageParam & { timestamp?: string };
+
+// Local time with its UTC offset (e.g. 2026-09-29T15:04:05+06:00), so the
+// file reads in Bishkek time but still sorts and parses unambiguously.
+function localTimestamp(date = new Date()): string {
+  const offsetMinutes = -date.getTimezoneOffset();
+  const pad = (n: number) => String(Math.floor(Math.abs(n))).padStart(2, '0');
+  const local = new Date(date.getTime() + offsetMinutes * 60_000)
+    .toISOString()
+    .slice(0, 19);
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  return `${local}${sign}${pad(offsetMinutes / 60)}:${pad(offsetMinutes % 60)}`;
+}
+
+function stamped(message: Anthropic.MessageParam): StoredMessage {
+  return { ...message, timestamp: localTimestamp() };
+}
+
+function toApiMessages(history: StoredMessage[]): Anthropic.MessageParam[] {
+  return history.map(({ timestamp: _timestamp, ...message }) => message);
+}
+
 // Persists chat history to disk so restarting the bot doesn't wipe context.
-function loadConversations(): Map<string, Anthropic.MessageParam[]> {
+function loadConversations(): Map<string, StoredMessage[]> {
   try {
     const raw = fs.readFileSync(CONVERSATIONS_PATH, 'utf-8');
-    const parsed = JSON.parse(raw) as Record<string, Anthropic.MessageParam[]>;
+    const parsed = JSON.parse(raw) as Record<string, StoredMessage[]>;
     return new Map(Object.entries(parsed));
   } catch {
     return new Map();
@@ -171,9 +196,7 @@ function stripFormatting(text: string): string {
 // Trimming must not leave a tool_result as the first message — the API
 // rejects a history whose opening message answers a tool call that is no
 // longer there.
-function trimHistory(
-  history: Anthropic.MessageParam[]
-): Anthropic.MessageParam[] {
+function trimHistory(history: StoredMessage[]): StoredMessage[] {
   const trimmed = history.slice(-MAX_HISTORY_MESSAGES);
   const start = trimmed.findIndex(
     (message) =>
@@ -186,7 +209,7 @@ function trimHistory(
 
 async function getReply(chatId: string, userText: string): Promise<string> {
   const history = conversations.get(chatId) ?? [];
-  history.push({ role: 'user', content: userText });
+  history.push(stamped({ role: 'user', content: userText }));
 
   let reply = '';
 
@@ -204,7 +227,7 @@ async function getReply(chatId: string, userText: string): Promise<string> {
       output_config: { effort: 'low' },
       system: systemBlocks(),
       tools: PREMIUM_TOOLS,
-      messages: history,
+      messages: toApiMessages(history),
     });
 
     // Cache hits are what make the large system prompt affordable. If `read`
@@ -227,7 +250,7 @@ async function getReply(chatId: string, userText: string): Promise<string> {
       reply =
         stripFormatting((textBlock?.text ?? '').trim()).trim() ||
         pickRandom(FALLBACK_EMPTY_REPLIES);
-      history.push({ role: 'assistant', content: reply });
+      history.push(stamped({ role: 'assistant', content: reply }));
       break;
     }
 
@@ -235,8 +258,10 @@ async function getReply(chatId: string, userText: string): Promise<string> {
       console.log(`[tool] ${toolUse.name} ${JSON.stringify(toolUse.input)}`);
     }
 
-    history.push({ role: 'assistant', content: response.content });
-    history.push({ role: 'user', content: toolUses.map(executePremiumTool) });
+    history.push(stamped({ role: 'assistant', content: response.content }));
+    history.push(
+      stamped({ role: 'user', content: toolUses.map(executePremiumTool) })
+    );
   }
 
   conversations.set(chatId, trimHistory(history));
