@@ -21,7 +21,7 @@ if (!ANTHROPIC_API_KEY) {
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
-const MODEL = 'claude-haiku-4-5';
+const MODEL = 'claude-sonnet-5';
 
 const BUSINESS_INFO_PATH = path.join(__dirname, 'business-info.md');
 
@@ -68,7 +68,7 @@ const SYSTEM_PROMPT = businessInfo
   ? `${BASE_SYSTEM_PROMPT}\n\nUse the following business information to answer customer questions. If the answer isn't in this info, say you'll check and get back to them — don't make it up.\n\n${businessInfo}`
   : BASE_SYSTEM_PROMPT;
 
-// The business info is ~25k tokens and goes out with every single message, so
+// The business info is ~23k tokens and goes out with every single message, so
 // it dominates the bill. Tools render before the system prompt, so one
 // breakpoint here caches the tool definitions and the business info together.
 // Both are built once at startup, which keeps the cached prefix byte-identical
@@ -193,11 +193,16 @@ async function getReply(chatId: string, userText: string): Promise<string> {
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const response = await anthropic.messages.create({
       model: MODEL,
-      max_tokens: 1024,
+      // Sonnet 5 thinks before answering by default, and those thinking tokens
+      // count against max_tokens — the old 1024 could cut a reply off mid-way.
+      // This is a ceiling, not a cost: short replies still bill only what they use.
+      max_tokens: 16000,
+      // Low effort measured as accurate as medium on this bot's hardest case
+      // (two drivers given by birth date) while cheaper and faster. Raise to
+      // 'medium' if replies start showing shallow reasoning on calculations.
+      // No `temperature`: Sonnet 5 rejects non-default sampling parameters.
+      output_config: { effort: 'low' },
       system: systemBlocks(),
-      // Slightly higher temperature so replies (and especially near-duplicate
-      // messages) don't come back worded identically every time.
-      temperature: 1,
       tools: PREMIUM_TOOLS,
       messages: history,
     });
